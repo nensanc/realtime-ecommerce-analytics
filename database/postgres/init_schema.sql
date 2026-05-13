@@ -17,7 +17,11 @@ CREATE TABLE IF NOT EXISTS sales_metrics (
     avg_order_value   DECIMAL(10, 2) NOT NULL DEFAULT 0,
     unique_customers  INTEGER NOT NULL DEFAULT 0,
     category          VARCHAR(100),
-    created_at        TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    created_at        TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    -- Idempotency key for streaming UPSERT (one row per window+category).
+    -- NULLS NOT DISTINCT treats NULL category as a real value for uniqueness.
+    CONSTRAINT uq_sales_metrics_window_category
+        UNIQUE NULLS NOT DISTINCT (window_start, category)
 );
 
 CREATE INDEX IF NOT EXISTS idx_sales_metrics_window
