@@ -34,15 +34,20 @@ CREATE INDEX IF NOT EXISTS idx_sales_metrics_category
 -- fraud_events
 -- ============================================
 CREATE TABLE IF NOT EXISTS fraud_events (
-    id              SERIAL PRIMARY KEY,
-    transaction_id  UUID NOT NULL,
-    user_id         INTEGER NOT NULL,
-    amount          DECIMAL(12, 2) NOT NULL,
-    fraud_score     DECIMAL(3, 2) NOT NULL CHECK (fraud_score BETWEEN 0 AND 1),
-    reason          TEXT NOT NULL,
-    location_city   VARCHAR(100),
+    id               SERIAL PRIMARY KEY,
+    transaction_id   UUID NOT NULL,
+    alert_type       VARCHAR(50) NOT NULL,
+    user_id          INTEGER NOT NULL,
+    amount           DECIMAL(12, 2) NOT NULL,
+    fraud_score      DECIMAL(3, 2) NOT NULL CHECK (fraud_score BETWEEN 0 AND 1),
+    reason           TEXT NOT NULL,
+    location_city    VARCHAR(100),
     location_country VARCHAR(100),
-    detected_at     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    detected_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    -- Idempotency: the same transaction can be flagged once per rule type,
+    -- but not twice by the same rule on replay.
+    CONSTRAINT uq_fraud_events_tx_type
+        UNIQUE (transaction_id, alert_type)
 );
 
 CREATE INDEX IF NOT EXISTS idx_fraud_events_user

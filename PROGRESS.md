@@ -2,8 +2,8 @@
 
 > Quick status dashboard. For detailed sprint logs see [`docs/SPRINT_PROGRESS.md`](docs/SPRINT_PROGRESS.md).
 
-**Last updated:** May 13, 2026
-**Current phase:** Sprint 2 complete ✅ → Sprint 3 next
+**Last updated:** May 14, 2026
+**Current phase:** Sprint 3 complete ✅ → Sprint 4 next
 
 ---
 
@@ -13,8 +13,8 @@
 Sprint 0  ✅  Infrastructure (Docker stack, schema, .env)
 Sprint 1  ✅  Transaction generator (Kafka producer + catalog + users)
 Sprint 2  ✅  PySpark Structured Streaming → PostgreSQL
-Sprint 3  🔜  Fraud detection
-Sprint 4  ⏳  Streamlit dashboard
+Sprint 3  ✅  Fraud detection (3 rules: stateless + 2 stateful)
+Sprint 4  🔜  Streamlit dashboard
 ```
 
 ---
@@ -36,35 +36,26 @@ Sprint 4  ⏳  Streamlit dashboard
 
 1. **Reusable Kafka producer** (`streaming/producers/config.py`)
    - Production-grade settings: `acks=all`, retries, gzip compression, batching
-   - Centralized config + JSON serialization + structured logging
-   - Library logs quieted to WARNING (only app logs surface at INFO)
 2. **Static reference data** (`streaming/producers/catalog.py`)
-   - 100 products across 5 categories (Electronics, Clothing, Books, Home, Sports)
-   - 1000 users: 70% Colombia, 30% international across 7 countries
+   - 100 products across 5 categories, 1000 users (70% Colombia, 30% intl)
    - Deterministic seed (42) for reproducible debugging
 3. **Transaction generator** (`streaming/producers/transaction_generator.py`)
-   - Continuous stream of realistic order events
-   - Configurable rate via `TRANSACTION_RATE` env var (default 10 TPS)
-   - Keyed by `user_id` → same user always lands on the same partition
-   - Async sends with success/error callbacks
-   - Graceful shutdown on SIGINT/SIGTERM (flushes in-flight messages)
-4. **End-to-end validated**: Python → Kafka → visible in Kafka UI
+   - Configurable rate, keyed by `user_id`, async sends, graceful shutdown
+   - Sprint 3 update: 2% probability of anomalous location (to seed geographic fraud)
 
-### Verified metrics
+### Verified
 
 | Metric | Target | Actual |
 |---|---|---|
-| Throughput | 10 TPS | 9.9 TPS (within 1%) |
-| Errors over 500+ messages | 0 | 0 |
-| Producer connection time | <500ms | ~100ms |
-| Catalog + users build | <1s | <100ms |
+| Throughput | 10 TPS | 9.9 TPS |
+| Errors over 500+ msgs | 0 | 0 |
 
 ### Lessons captured
 
-- `kafka-python` is unmaintained → use `kafka-python-ng` (drop-in fork) for Python 3.12 compatibility
+- `kafka-python` is unmaintained → use `kafka-python-ng` for Python 3.12
 - Don't name local packages after installed libraries (renamed `kafka/` → `streaming/`)
-- Pure-Python Kafka client lacks `enable_idempotence` and `delivery_timeout_ms` (Java/librdkafka-only); documented in code
-- Quiet noisy library loggers — keep only WARNING+ from `kafka.*`
+- Pure-Python Kafka client lacks `enable_idempotence` / `delivery_timeout_ms`
+- Quiet noisy library loggers (WARNING+ from `kafka.*`)
 - Deterministic seeding makes streaming bugs reproducible
 
 ---
@@ -74,85 +65,114 @@ Sprint 4  ⏳  Streamlit dashboard
 ### What's working end-to-end
 
 1. **Reusable Spark session factory** (`spark/streaming/spark_session.py`)
-   - Auto-downloads Kafka connector + Postgres JDBC driver via Maven coordinates
-   - Tuned for local development: 8 shuffle partitions, UTC timezone, adaptive execution
-   - Library log level set to WARN (Spark is catastrophically verbose at INFO)
+   - Auto-downloads Kafka + Postgres JDBC JARs via Maven coordinates
 2. **Explicit transaction schema** (`spark/streaming/schemas.py`)
-   - `StructType` with 14 top-level fields and a nested `location` struct
-   - Strict nullability on critical fields (IDs, money, timestamp), lenient on names
-   - Documented choice of `DoubleType` over `DecimalType` (acceptable tradeoff for portfolio)
+   - 14 fields + nested `location` struct
 3. **PostgreSQL UPSERT writer** (`spark/streaming/postgres_writer.py`)
-   - `psycopg2` + `execute_values` for bulk UPSERT inside `foreachBatch`
-   - `ON CONFLICT ... DO UPDATE` against `(window_start, category)` unique constraint
-   - `NULLS NOT DISTINCT` (Postgres 15+) so NULL-category overall rows are also deduplicated
-   - Context-managed connection (commit on success, rollback on error)
+   - `psycopg2.execute_values` + `ON CONFLICT ... DO UPDATE`
+   - Constraint `(window_start, category) NULLS NOT DISTINCT` for idempotency
 4. **Streaming aggregation job** (`spark/streaming/process_transactions.py`)
-   - Reads `transactions` topic with `startingOffsets=latest`
-   - 5-minute watermark on event-time timestamps to bound state
-   - 1-minute tumbling windows with two parallel queries:
-     - **Overall metrics** (category=NULL): total_sales, order_count, avg_order_value, unique_customers
-     - **Per-category breakdown** (category populated): category_sales, category_orders
-   - 10-second trigger interval, `outputMode("update")`
-   - Separate checkpoint directories per query
+   - 1-min tumbling windows + 5-min watermark
+   - Two parallel queries: overall + per-category
 
 ### Verified end-to-end
 
-Sample query against `sales_metrics` after running both terminals for ~2 minutes:
-
-```
-    window_start     |  category   | total_sales | order_count | avg_order_value | unique_customers
----------------------+-------------+-------------+-------------+-----------------+------------------
- 2026-05-13 16:09:00 |             |   122225.84 |         286 |          427.36 |              242
- 2026-05-13 16:09:00 | Books       |     7070.86 |          60 |          117.85 |                0
- 2026-05-13 16:09:00 | Clothing    |     8524.48 |          40 |          213.11 |                0
- 2026-05-13 16:09:00 | Electronics |    73598.57 |          60 |         1226.64 |                0
- 2026-05-13 16:09:00 | Home        |    22041.06 |          60 |          367.35 |                0
- 2026-05-13 16:09:00 | Sports      |    10990.87 |          66 |          166.53 |                0
-```
-
-**Sanity checks that pass:**
-
-- Categories sum exactly to overall (`$7,070.86 + $8,524.48 + $73,598.57 + $22,041.06 + $10,990.87 = $122,225.84` ✓)
-- Order counts sum exactly (`60 + 40 + 60 + 60 + 66 = 286` ✓)
-- `unique_customers` = 242 out of 286 orders ≈ 85% unique (HyperLogLog estimate, plausible)
-- Electronics drives revenue ($73K) while having the same order count as Books/Home — high-ticket behavior matches realistic e-commerce
+- Categories sum exactly to overall (`$122,225.84` across 5 categories ✓)
+- Order counts sum exactly (`286 = 60+40+60+60+66` ✓)
+- UPSERT idempotent on replay
 
 ### Lessons captured
 
-- Structured Streaming's 3-layer Kafka parse: binary → string → typed via `from_json` + schema
-- Explicit schemas are **mandatory** for streaming JSON sources (no inference possible)
-- Tumbling windows + watermarks are the foundation of streaming analytics — without watermark, state grows forever
-- `foreachBatch` is the escape hatch for non-native sinks (JDBC writer can't UPSERT)
-- Never `.collect()` raw stream; only post-aggregation results (tiny by definition)
-- Each streaming query needs its **own** checkpoint directory — shared paths corrupt state
-- `outputMode("update")` pairs perfectly with UPSERT sinks; `complete` is OOM-prone, `append` adds latency
-- PySpark's API isn't 1:1 with Scala (e.g., `StructType.treeString` doesn't exist in Python)
-- `approx_count_distinct` (HyperLogLog) is the right unique-count primitive for streaming aggregations
+- Structured Streaming's 3-layer Kafka parse: binary → string → typed via `from_json`
+- Explicit schemas are mandatory for streaming JSON
+- Watermark bounds state; no watermark = OOM eventually
+- `foreachBatch` is the escape hatch for non-native sinks
+- Per-query checkpoint directories — shared paths corrupt state
+- `outputMode("update")` pairs perfectly with UPSERT sinks
+- `approx_count_distinct` (HyperLogLog) for streaming uniqueness
 
 ---
 
-## 🔜 Sprint 3 — Fraud Detection (NEXT)
+## ✅ Sprint 3 — Fraud Detection (DONE)
 
-**Goal:** identify suspicious transactions in real time and publish alerts.
+### What's working end-to-end
+
+**Three fraud rules, all running in parallel as independent streaming queries:**
+
+| # | Rule | Type | How it works |
+|---|---|---|---|
+| 1 | **High-value** | Stateless | Filter `total_amount > FRAUD_THRESHOLD` ($1000) |
+| 2 | **Rapid purchases** | Stateful (windowed) | `groupBy(window, user_id) + count >= 3` per 60s |
+| 3 | **Geographic impossibility** | Stateful (windowed + UDF) | `collect_list(coords)` + Haversine UDF, flag >500 km within 60s |
+
+**Dual-sink fan-out pattern:**
+Each detected fraud row goes to **both** sinks in a single `foreachBatch`:
+- **PostgreSQL** `fraud_events` table (audit trail, dashboard queries)
+- **Kafka** `fraud-alerts` topic (real-time consumers)
+
+`DataFrame.persist()` ensures the upstream is computed once, then read twice.
+
+### Components built
+
+1. **`spark/streaming/kafka_writer.py`** — Kafka alert publisher via `foreachBatch`
+2. **`spark/streaming/fraud_writer.py`** — Postgres UPSERT writer for `fraud_events`
+3. **`spark/streaming/fraud_detector.py`** — Three streaming queries (~290 lines)
+4. **Schema upgrade** — `fraud_events`: added `alert_type` column + unique constraint `(transaction_id, alert_type)`
+5. **Generator anomaly injection** — 2% chance of mismatched location (to seed Rule 3)
+
+### Fraud scoring formulas
+
+| Rule | Score formula | Range |
+|---|---|---|
+| `high_value` | `0.5 + (amount - threshold) / (threshold * 4) * 0.5` | 0.50 → 1.00 |
+| `rapid_purchases` | `0.4 + order_count * 0.08` | 0.56 → 1.00 (capped at 8+ orders) |
+| `geographic_impossibility` | `0.5 + distance_km / 10000 * 0.5` | 0.55 → 1.00 |
+
+### Verified end-to-end (5-min snapshot with NUM_USERS=50)
+
+```
+        alert_type        | detections | avg_score
+--------------------------+------------+-----------
+ geographic_impossibility |          1 |     0.650
+ high_value               |        206 |     0.630
+ rapid_purchases          |        250 |     0.979
+```
+
+**Sample geographic_impossibility alert:**
+
+```
+ user_id | fraud_score |                                reason
+---------+-------------+----------------------------------------------------------------------
+      49 |        0.65 | Geographic impossibility: user 49 in cities 3016 km apart within 60s
+```
+
+(Haversine math verified: `0.5 + 3016/10000 * 0.5 = 0.651` → rounds to `0.65` ✓)
+
+### Lessons captured
+
+- **Stateless rules** are trivial filters; **stateful rules** require `groupBy(window, key) + watermark`
+- `outputMode("append")` on windowed aggregations only emits **after watermark passes window end** — first alerts can lag minutes
+- `lag()` window function doesn't work in streaming `groupBy(user_id)` (Spark restriction) — windowed aggregation + UDF is the pragmatic workaround
+- Fan-out sinks: one `foreachBatch` + `persist()` >> two separate `writeStream` queries
+- UDFs registered with explicit return type (`DoubleType()`) for streaming compatibility
+- Watermark tuning matters: 5min for production safety vs 30s for fast feedback during dev
+- Composite unique constraints `(transaction_id, alert_type)` allow the same transaction to be flagged by multiple rules without duplicates per rule
+
+---
+
+## 🔜 Sprint 4 — Streamlit Dashboard (NEXT)
+
+**Goal:** real-time UI on top of the data we now have in PostgreSQL.
 
 ### Planned tasks
 
-- [ ] High-value transaction rule: any single order over `FRAUD_THRESHOLD` ($1000 default)
-- [ ] Rapid-purchase pattern: ≥3 orders from same user in <60 seconds (stateful)
-- [ ] Geographic impossibility: same user, two cities >500km apart, within 5 minutes
-- [ ] Publish alerts to Kafka `fraud-alerts` topic
-- [ ] Persist events to `fraud_events` table with `fraud_score` (0.0-1.0) and `reason`
-- [ ] Unit tests for the rules
-
----
-
-## ⏳ Sprint 4 — Streamlit Dashboard (PLANNED)
-
-- Real-time sales chart from `sales_metrics` (Plotly)
-- Alerts panel reading from Redis cache
-- Inventory grid
-- Auto-refresh every 5 seconds
-- KPI cards (TPS, avg order value, active users)
+- [ ] `streamlit==1.30.0` + `plotly==5.18.0` deps
+- [ ] Live sales chart from `sales_metrics`
+- [ ] Fraud feed from `fraud_events` (with score color coding)
+- [ ] KPI cards: current TPS, avg order value, alert count
+- [ ] Per-category breakdown chart
+- [ ] Auto-refresh every 5 seconds
+- [ ] (Stretch) consume directly from `fraud-alerts` Kafka topic for sub-second latency
 
 ---
 
@@ -168,19 +188,39 @@ source venv/bin/activate
 # Terminal 1 — Generator
 python -m streaming.producers.transaction_generator
 
-# Terminal 2 — Spark streaming → Postgres
+# Terminal 2 — Sales aggregation
 python -m spark.streaming.process_transactions
 
-# Terminal 3 — Inspect the data being written
+# Terminal 3 — Fraud detection (3 rules running in parallel)
+python -m spark.streaming.fraud_detector
+
+# Terminal 4 — Inspect
 docker exec -it postgres psql -U ecommerce_user -d ecommerce -c "
-SELECT window_start, category, total_sales, order_count
-FROM sales_metrics
-ORDER BY window_start DESC, category NULLS FIRST
-LIMIT 10;
+SELECT alert_type, COUNT(*), ROUND(AVG(fraud_score)::numeric, 3) AS avg_score
+FROM fraud_events
+WHERE detected_at > NOW() - INTERVAL '5 minutes'
+GROUP BY alert_type
+ORDER BY alert_type;
 "
 ```
 
-Stop all terminals with `Ctrl+C`. Before laptop shutdown, run `docker compose down` to avoid stale Zookeeper state on next boot.
+### 🧪 Tuning for fraud demos
+
+`Rule 2` (rapid purchases) only fires reliably when there's enough user collision. With the default `NUM_USERS=1000` at 10 TPS, collisions are rare. To make Rule 2 fire heavily for demonstration:
+
+```bash
+# Temporarily reduce user pool
+sed -i 's/NUM_USERS=1000/NUM_USERS=50/' .env
+# Restart the generator
+```
+
+Revert when done:
+
+```bash
+sed -i 's/NUM_USERS=50/NUM_USERS=1000/' .env
+```
+
+Stop everything with `Ctrl+C`. Before laptop shutdown, run `docker compose down` to avoid stale Zookeeper state on next boot.
 
 ---
 
@@ -188,31 +228,27 @@ Stop all terminals with `Ctrl+C`. Before laptop shutdown, run `docker compose do
 
 ```
 realtime-ecommerce-analytics/
-├── streaming/                         # Sprint 1: Kafka producer side
-│   ├── __init__.py
+├── streaming/                            # Kafka producer side
 │   ├── smoke_test.py
-│   ├── producers/
-│   │   ├── __init__.py
-│   │   ├── config.py
-│   │   ├── catalog.py
-│   │   └── transaction_generator.py
-│   └── consumers/
-│       └── __init__.py
-├── spark/                             # Sprint 2: Spark streaming side
-│   ├── __init__.py
-│   ├── streaming/
-│   │   ├── __init__.py
-│   │   ├── spark_session.py           # Session factory
-│   │   ├── schemas.py                 # Typed transaction schema
-│   │   ├── postgres_writer.py         # UPSERT writer (foreachBatch)
-│   │   └── process_transactions.py    # Main streaming job
-│   └── batch/                         # (reserved for batch jobs)
-├── dashboard/                         # Sprint 4 (empty)
+│   └── producers/
+│       ├── config.py
+│       ├── catalog.py
+│       └── transaction_generator.py
+├── spark/                                # Spark streaming side
+│   └── streaming/
+│       ├── spark_session.py              # Session factory
+│       ├── schemas.py                    # Typed schema
+│       ├── postgres_writer.py            # sales_metrics UPSERT (Sprint 2)
+│       ├── process_transactions.py       # Sales aggregation (Sprint 2)
+│       ├── fraud_writer.py               # fraud_events UPSERT (Sprint 3)
+│       ├── kafka_writer.py               # fraud-alerts publisher (Sprint 3)
+│       └── fraud_detector.py             # 3-rule fraud detector (Sprint 3)
+├── dashboard/                            # Sprint 4 (empty)
 ├── database/
 │   ├── postgres/init_schema.sql
 │   └── redis/keys_structure.md
 ├── data/
-│   ├── checkpoints/                   # Spark streaming state (gitignored)
+│   ├── checkpoints/                      # 5 dirs: 2 sales + 3 fraud (gitignored)
 │   ├── logs/
 │   └── output/
 ├── tests/

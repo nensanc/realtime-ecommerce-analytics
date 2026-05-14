@@ -32,6 +32,9 @@ from typing import Any
 from dotenv import load_dotenv
 
 from streaming.producers.catalog import (
+    COLOMBIAN_CITIES,
+    INTERNATIONAL_CITIES,
+    Location,
     Product,
     User,
     build_product_catalog,
@@ -61,6 +64,10 @@ PAYMENT_WEIGHTS = [0.55,         0.25,          0.15,    0.05]   # sum=1.0
 DEVICE_TYPES = ["mobile", "desktop", "tablet"]
 DEVICE_WEIGHTS = [0.65,    0.30,      0.05]                       # sum=1.0
 
+# ~2% of transactions use a RANDOM location instead of the user's home city.
+# Models account-takeover scenarios for geographic-impossibility fraud testing.
+ANOMALY_LOCATION_PROB = 0.02
+
 # Quantity distribution: most orders are 1-2 items
 QUANTITY_CHOICES = [1, 1, 1, 1, 2, 2, 2, 3, 4, 5]
 
@@ -68,10 +75,28 @@ QUANTITY_CHOICES = [1, 1, 1, 1, 2, 2, 2, 3, 4, 5]
 # ---------------------------------------------------------------------
 # Transaction builder
 # ---------------------------------------------------------------------
+def _maybe_anomalous_location(user_location: Location) -> Location:
+    """
+    Return either the user's home location or, with low probability,
+    a totally different random one. Used to seed geographic-impossibility
+    fraud signals.
+    """
+    if random.random() >= ANOMALY_LOCATION_PROB:
+        return user_location
+
+    # Pick a random city (international preferred for visible distance)
+    if random.random() < 0.7:
+        country, city, lat, lon = random.choice(INTERNATIONAL_CITIES)
+        return Location(country=country, city=city, latitude=lat, longitude=lon)
+    city, lat, lon = random.choice(COLOMBIAN_CITIES)
+    return Location(country="Colombia", city=city, latitude=lat, longitude=lon)
+
+
 def build_transaction(user: User, product: Product) -> dict[str, Any]:
     """Build a single transaction event matching the target schema."""
     quantity = random.choice(QUANTITY_CHOICES)
     total = round(product.unit_price * quantity, 2)
+    location = _maybe_anomalous_location(user.location)
 
     return {
         "transaction_id": str(uuid.uuid4()),
@@ -85,7 +110,7 @@ def build_transaction(user: User, product: Product) -> dict[str, Any]:
         "unit_price": product.unit_price,
         "total_amount": total,
         "payment_method": random.choices(PAYMENT_METHODS, PAYMENT_WEIGHTS)[0],
-        "location": user.location.to_dict(),
+        "location": location.to_dict(),
         "session_id": f"sess_{uuid.uuid4().hex[:8]}",
         "device_type": random.choices(DEVICE_TYPES, DEVICE_WEIGHTS)[0],
     }
