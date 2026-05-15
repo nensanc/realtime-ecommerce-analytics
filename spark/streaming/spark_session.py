@@ -18,6 +18,33 @@ from __future__ import annotations
 import logging
 import os
 
+# ---------------------------------------------------------------------
+# Pin BOTH the JVM and the Python process to UTC, BEFORE pyspark
+# launches the JVM and BEFORE any timestamp arithmetic happens.
+#
+# Two distinct bugs to defeat:
+#
+#  1. JVM TZ — in local[*] mode, `spark.driver.extraJavaOptions` is
+#     read AFTER the JVM has already started, so `-Duser.timezone=UTC`
+#     there is a no-op. `JAVA_TOOL_OPTIONS` is honored by every JVM on
+#     startup, so setting it here is what actually pins the JVM.
+#
+#  2. Python TZ — PySpark converts Spark timestamps to Python via
+#     `datetime.fromtimestamp(ts)` (no tz arg), which uses the C
+#     library's localtime() → reads the `TZ` env var. Setting `TZ`
+#     alone is not enough on Linux: libc caches the previous TZ and
+#     only re-reads when `tzset()` is called. Without `time.tzset()`,
+#     collected timestamps land in the host's local TZ and get stored
+#     offset-by-N-hours in TIMESTAMP (no-tz) Postgres columns.
+# ---------------------------------------------------------------------
+import time
+
+os.environ["TZ"] = "UTC"
+time.tzset()
+os.environ["JAVA_TOOL_OPTIONS"] = (
+    os.environ.get("JAVA_TOOL_OPTIONS", "") + " -Duser.timezone=UTC"
+).strip()
+
 from dotenv import load_dotenv
 from pyspark.sql import SparkSession
 
@@ -87,6 +114,12 @@ def create_spark_session(
         # --- Sensible defaults for local development -------------------
         .config("spark.sql.shuffle.partitions", "8")
         .config("spark.sql.session.timeZone", "UTC")
+        # Belt-and-braces: JAVA_TOOL_OPTIONS set at module import time
+        # is what actually pins the JVM TZ in local mode; these configs
+        # remain for cluster/spark-submit deployments where the JVM is
+        # launched fresh and reads extraJavaOptions before startup.
+        .config("spark.driver.extraJavaOptions", "-Duser.timezone=UTC")
+        .config("spark.executor.extraJavaOptions", "-Duser.timezone=UTC")
         .config("spark.sql.adaptive.enabled", "true")
         # --- Streaming-specific ----------------------------------------
         # Each query will set its own checkpointLocation; we keep this as

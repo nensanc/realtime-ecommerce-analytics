@@ -1,28 +1,28 @@
 # Real-Time E-Commerce Analytics Platform
 
-> Streaming data platform that processes e-commerce transactions in real-time using **Apache Kafka** and **PySpark Structured Streaming**, with **PostgreSQL** as the durable analytics store and **multi-rule fraud detection** running in parallel.
+> End-to-end streaming data platform: **Kafka** for ingestion, **PySpark Structured Streaming** for processing, **PostgreSQL** for storage, **Streamlit** for the real-time dashboard. Includes a multi-rule fraud detection system with stateless, windowed, and UDF-based stateful detection.
 
-![Status](https://img.shields.io/badge/status-Sprint%203%20Complete-success)
+![Status](https://img.shields.io/badge/status-Complete-success)
 ![Python](https://img.shields.io/badge/python-3.12-blue)
 ![Kafka](https://img.shields.io/badge/kafka-3.6-black)
 ![Spark](https://img.shields.io/badge/spark-3.5-orange)
 ![PostgreSQL](https://img.shields.io/badge/postgres-15-blue)
+![Streamlit](https://img.shields.io/badge/streamlit-1.30-red)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 ---
 
 ## 🎯 Overview
 
-A production-grade streaming pipeline that:
+A complete streaming analytics pipeline running locally on Docker:
 
 - Ingests **10–1000 transactions per second** via Kafka
 - Computes **windowed sales analytics** (1-min tumbling windows, idempotent UPSERTs)
-- Detects **fraud in real time** with three concurrent rules — including stateful detection with custom UDFs
-- Fans out alerts to **both PostgreSQL (audit) and Kafka (real-time consumers)** in one pass
-- Visualizes everything on a **Streamlit dashboard** *(Sprint 4)*
+- Detects **fraud in real time** with three concurrent rules
+- Fans out alerts to **both PostgreSQL (audit) and Kafka (real-time consumers)**
+- Visualizes everything on a **Streamlit dashboard** with auto-refresh
 
-**Current status:** Sprint 3 complete — fraud detection with three rules in production.
-See [`PROGRESS.md`](PROGRESS.md) for the live status dashboard.
+See [`PROGRESS.md`](PROGRESS.md) for the detailed sprint-by-sprint log.
 
 ---
 
@@ -31,7 +31,7 @@ See [`PROGRESS.md`](PROGRESS.md) for the live status dashboard.
 ```
 ┌─────────────────────────┐
 │  Transaction Generator  │   Python + Faker, 10–1000 TPS
-│  - 100 products         │   ~2% anomalous locations (for fraud testing)
+│  - 100 products         │   2% anomalous locations
 │  - 1000 users           │
 └───────────┬─────────────┘
             │  key = user_id
@@ -43,19 +43,26 @@ See [`PROGRESS.md`](PROGRESS.md) for the live status dashboard.
 ┌──────────────────────────┐    ┌────────────────────────────────┐
 │  Sales Aggregator        │    │  Fraud Detector                │
 │  (process_transactions)  │    │  (fraud_detector)              │
-│  - 1-min tumbling        │    │  - Rule 1 high-value (stateless)│
-│  - per-category + overall│    │  - Rule 2 rapid purchases       │
-│  - foreachBatch UPSERT   │    │  - Rule 3 geographic imposs.    │
-└────────────┬─────────────┘    │  - dual sink fan-out            │
+│  - 1-min tumbling        │    │  - Rule 1 high-value           │
+│  - per-category + overall│    │  - Rule 2 rapid purchases      │
+│  - foreachBatch UPSERT   │    │  - Rule 3 geographic imposs.   │
+└────────────┬─────────────┘    │  - dual sink fan-out           │
              │                  └─────────┬──────────────┬───────┘
              ▼                            ▼              ▼
        ┌─────────────────────────────────────────┐  ┌─────────────────┐
        │      PostgreSQL 15                      │  │   Kafka topic   │
        │      sales_metrics  +  fraud_events     │  │   fraud-alerts  │
-       └─────────────────────────────────────────┘  └─────────────────┘
-                            │                                │
-                            ▼                                ▼
-                              Streamlit Dashboard (Sprint 4 — planned)
+       └─────────────────┬───────────────────────┘  └─────────────────┘
+                         │
+                         ▼
+                ┌────────────────────┐
+                │ Streamlit Dashboard│
+                │ http://localhost:8501
+                │  - 4 KPI cards    │
+                │  - Sales line chart│
+                │  - Category bars  │
+                │  - Fraud table    │
+                └────────────────────┘
 ```
 
 ---
@@ -68,47 +75,11 @@ See [`PROGRESS.md`](PROGRESS.md) for the live status dashboard.
 | Kafka client       | `kafka-python-ng` 2.2.3                   |
 | Stream processing  | PySpark 3.5 (Structured Streaming)        |
 | Storage            | PostgreSQL 15 (with `psycopg2`)           |
-| Cache              | Redis 7                                   |
-| Dashboard          | Streamlit + Plotly *(planned)*            |
+| Dashboard          | Streamlit 1.30 + Plotly 5.18              |
+| Auto-refresh       | `streamlit-autorefresh` 1.0.1             |
 | Data generation    | Faker 22.0                                |
 | Infrastructure     | Docker Compose                            |
-| Language           | Python 3.12 + Java 17 (for the JVM)       |
-
----
-
-## 🔍 Fraud detection rules
-
-Three rules run in parallel as **independent streaming queries**, all writing to the same `fraud_events` table and `fraud-alerts` Kafka topic:
-
-### Rule 1 — High-value (stateless)
-
-Flags any single transaction whose amount exceeds `FRAUD_THRESHOLD` (default `$1000`).
-
-```python
-.filter(col("total_amount") > FRAUD_THRESHOLD)
-```
-
-**Score:** `0.5 + (amount - threshold) / (threshold * 4) * 0.5`, capped at 1.0.
-
-### Rule 2 — Rapid purchases (stateful, windowed)
-
-Flags users with **≥3 orders inside a 60-second tumbling window**. Catches card-testing and bulk-buy attacks.
-
-```python
-.groupBy(window(timestamp, "1 minute"), user_id)
-.agg(count("*").alias("order_count"))
-.filter(col("order_count") >= 3)
-```
-
-**Score:** `0.4 + order_count * 0.08`, capped at 1.0.
-
-### Rule 3 — Geographic impossibility (stateful, windowed + UDF)
-
-Flags users whose orders span **two or more cities >500 km apart within a 60-second window**. Catches stolen-account scenarios where the thief is in a different country.
-
-Uses `collect_list()` of coordinates per user-window, then a **Haversine UDF** computes the max pairwise distance.
-
-**Score:** `0.5 + distance_km / 10000 * 0.5`, capped at 1.0.
+| Language           | Python 3.12 + Java 17                     |
 
 ---
 
@@ -119,7 +90,7 @@ Uses `collect_list()` of coordinates per user-window, then a **Haversine UDF** c
 - Docker & Docker Compose
 - Python 3.12+
 - OpenJDK 17 (Spark requirement)
-- ~6 GB RAM available for containers + JVM
+- ~6 GB RAM available
 
 ### 1. Clone & configure
 
@@ -141,7 +112,7 @@ docker compose up -d
 | Zookeeper   | 2181  | Kafka coordination         |
 | Kafka UI    | 8080  | Visual broker management   |
 | PostgreSQL  | 5432  | Aggregated metrics + fraud |
-| Redis       | 6379  | Real-time cache            |
+| Redis       | 6379  | Real-time cache (reserved) |
 
 ```bash
 docker compose ps   # all 5 should be (healthy)
@@ -156,66 +127,67 @@ pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-### 4. Run the full pipeline (three terminals)
-
-**Terminal 1 — generator:**
+### 4. Run the full pipeline (four terminals)
 
 ```bash
+# Terminal 1 — generator
 source venv/bin/activate
 python -m streaming.producers.transaction_generator
-```
 
-**Terminal 2 — sales aggregation:**
-
-```bash
+# Terminal 2 — sales aggregation
 source venv/bin/activate
 python -m spark.streaming.process_transactions
-```
 
-**Terminal 3 — fraud detection:**
-
-```bash
+# Terminal 3 — fraud detection
 source venv/bin/activate
 python -m spark.streaming.fraud_detector
+
+# Terminal 4 — dashboard (PYTHONPATH=. is required)
+source venv/bin/activate
+PYTHONPATH=. streamlit run dashboard/app.py
 ```
 
-⏳ First Spark startup takes ~60s. Subsequent runs are ~10s.
+⏳ First Spark startup takes ~60s (downloads Kafka & Postgres JARs). Subsequent runs are ~10s.
 
-### 5. Query the results
+### 5. Open the dashboard
 
-**Sales metrics:**
+**http://localhost:8501**
 
-```bash
-docker exec -it postgres psql -U ecommerce_user -d ecommerce -c "
-SELECT window_start, category, total_sales, order_count
-FROM sales_metrics
-ORDER BY window_start DESC, category NULLS FIRST
-LIMIT 12;
-"
-```
+You should see:
 
-**Fraud detections:**
+- **4 KPI cards** (sales, orders, users, fraud) with hour-over-hour deltas
+- **Line chart** of sales per minute over the last hour
+- **Bar chart** of sales by category, color-coded
+- **Fraud alerts table** with score-based color coding (green/yellow/red)
+- **Sidebar** with auto-refresh interval, time window selector, max alerts slider
 
-```bash
-docker exec -it postgres psql -U ecommerce_user -d ecommerce -c "
-SELECT alert_type, COUNT(*) AS detections,
-       ROUND(AVG(fraud_score)::numeric, 3) AS avg_score
-FROM fraud_events
-WHERE detected_at > NOW() - INTERVAL '5 minutes'
-GROUP BY alert_type
-ORDER BY alert_type;
-"
-```
+The dashboard auto-refreshes every 5 seconds by default — watch the numbers grow live.
 
-Sample output:
+---
 
-```
-        alert_type        | detections | avg_score
---------------------------+------------+-----------
- geographic_impossibility |          1 |     0.650
- high_value               |        206 |     0.630
- rapid_purchases          |        250 |     0.979
-```
+## 🔍 Fraud detection rules
+
+Three rules run in parallel as **independent streaming queries**, all writing to the same `fraud_events` table and `fraud-alerts` Kafka topic.
+
+### Rule 1 — High-value (stateless)
+
+Flags any single transaction whose amount exceeds `FRAUD_THRESHOLD` (default `$1000`).
+
+**Score:** `0.5 + (amount - threshold) / (threshold * 4) * 0.5`, capped at 1.0.
+
+### Rule 2 — Rapid purchases (stateful, windowed)
+
+Flags users with **≥3 orders inside a 60-second tumbling window**. Catches card-testing and bulk-buy attacks.
+
+**Score:** `0.4 + order_count * 0.08`, capped at 1.0.
+
+### Rule 3 — Geographic impossibility (stateful, windowed + UDF)
+
+Flags users whose orders span **two or more cities >500 km apart within a 60-second window**. Catches stolen-account scenarios where the thief is in a different country.
+
+Uses `collect_list()` of coordinates per user-window, then a **Haversine UDF** computes the max pairwise distance.
+
+**Score:** `0.5 + distance_km / 10000 * 0.5`, capped at 1.0.
 
 ---
 
@@ -224,8 +196,8 @@ Sample output:
 Rule 2 (rapid purchases) only fires reliably when many users overlap in time. With the default `NUM_USERS=1000` at 10 TPS, collisions are rare. To force it for a visible demo:
 
 ```bash
-# Reduce user pool — restart the generator afterwards
 sed -i 's/NUM_USERS=1000/NUM_USERS=50/' .env
+# Restart the generator afterwards
 ```
 
 Revert when done:
@@ -265,21 +237,25 @@ realtime-ecommerce-analytics/
 │       └── transaction_generator.py
 ├── spark/                                # Spark streaming side
 │   └── streaming/
-│       ├── spark_session.py
-│       ├── schemas.py
+│       ├── spark_session.py              # Session factory
+│       ├── schemas.py                    # Typed schema
 │       ├── postgres_writer.py            # sales_metrics UPSERT
 │       ├── process_transactions.py       # Sales aggregation job
 │       ├── fraud_writer.py               # fraud_events UPSERT
 │       ├── kafka_writer.py               # fraud-alerts publisher
 │       └── fraud_detector.py             # 3-rule fraud detector
-├── dashboard/                            # Sprint 4 (planned)
+├── dashboard/                            # Streamlit web UI
+│   ├── app.py
+│   ├── utils/data.py
+│   └── components/
+│       ├── kpi_cards.py
+│       ├── sales_chart.py
+│       ├── category_chart.py
+│       └── fraud_table.py
 ├── database/
 │   ├── postgres/init_schema.sql
 │   └── redis/keys_structure.md
-├── data/
-│   ├── checkpoints/                      # Spark state (gitignored)
-│   ├── logs/
-│   └── output/
+├── data/                                 # checkpoints, logs, output (gitignored)
 ├── tests/
 ├── docs/
 ├── docker-compose.yml
@@ -291,7 +267,7 @@ realtime-ecommerce-analytics/
 
 ---
 
-## 📋 Sprint Progress
+## 📋 Sprint progress
 
 | Sprint | Description                                | Status         |
 |--------|--------------------------------------------|----------------|
@@ -299,13 +275,13 @@ realtime-ecommerce-analytics/
 | 1      | Transaction generator (Kafka producer)     | ✅ Complete    |
 | 2      | PySpark streaming → PostgreSQL             | ✅ Complete    |
 | 3      | Fraud detection (3 rules)                  | ✅ Complete    |
-| 4      | Streamlit dashboard                        | 🔜 Next        |
+| 4      | Streamlit dashboard                        | ✅ Complete    |
 
-See [`PROGRESS.md`](PROGRESS.md) for full sprint detail.
+See [`PROGRESS.md`](PROGRESS.md) for sprint-by-sprint detail.
 
 ---
 
-## 📊 Schemas
+## 📊 Data schemas
 
 ### Transaction event (Kafka `transactions` topic)
 
@@ -323,10 +299,8 @@ See [`PROGRESS.md`](PROGRESS.md) for full sprint detail.
   "total_amount": 1299.99,
   "payment_method": "credit_card",
   "location": {
-    "country": "Colombia",
-    "city": "Rionegro",
-    "latitude": 6.1471,
-    "longitude": -75.3736
+    "country": "Colombia", "city": "Rionegro",
+    "latitude": 6.1471, "longitude": -75.3736
   },
   "session_id": "sess_a1b2c3d4",
   "device_type": "mobile"
@@ -356,16 +330,18 @@ See [`PROGRESS.md`](PROGRESS.md) for full sprint detail.
 | Decision | Rationale |
 |---|---|
 | `acks=all` + retries in producer | Durability over throughput — no data loss on broker failure |
-| Key by `user_id` | Same user → same partition → ordered events per user (essential for stateful fraud detection) |
-| Explicit Spark schema (not inference) | Mandatory for streaming JSON; also documents the data contract |
-| 30-sec watermark (dev) | Aggressive — fast feedback. Production would use 1–5 min based on observed event lag |
+| Key by `user_id` | Same user → same partition → ordered events per user (essential for stateful fraud) |
+| Explicit Spark schema (not inference) | Mandatory for streaming JSON; documents the data contract |
 | `foreachBatch` + `psycopg2` UPSERT | Spark's JDBC writer can't UPSERT; canonical workaround |
 | Unique constraints with `NULLS NOT DISTINCT` | Idempotent writes on stream restart — no duplicate rows |
 | Dual sink via `persist()` | Compute fraud detection once, write to Postgres + Kafka — no recomputation |
 | Per-query checkpoint directories | Shared checkpoint paths corrupt state — strict isolation |
-| Windowed groupBy for stateful rules (not `flatMapGroupsWithState`) | Simpler, idiomatic; misses cross-window bursts (documented tradeoff) |
+| Windowed groupBy for stateful rules | Simpler, idiomatic; documented tradeoff vs `flatMapGroupsWithState` |
 | Haversine via Python UDF | Standard pattern; UDF return type explicit (`DoubleType()`) |
 | `DoubleType` for money | Acceptable tradeoff for portfolio; would switch to `DecimalType(12,2)` in fintech |
+| `-Duser.timezone=UTC` on JVM | **Critical** — without this, Spark JDBC writes timestamps in JVM local TZ, breaking time-range queries |
+| Streamlit `@st.cache_data(ttl=5)` | Fresh enough for real-time, light on DB |
+| Sidebar config | Clean UX; the dashboard's main canvas stays focused on data |
 
 ---
 
@@ -383,7 +359,7 @@ docker compose down -v    # wipe volumes (clean slate)
 ## 👤 Author
 
 **Martin Sanchez** — Senior Data Engineer
-Built as a portfolio project to demonstrate streaming data engineering skills end-to-end.
+Built as a portfolio project to demonstrate end-to-end streaming data engineering skills.
 
 ---
 

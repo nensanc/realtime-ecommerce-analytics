@@ -70,7 +70,7 @@ STARTING_OFFSETS = "latest"
 TRIGGER_INTERVAL = "10 seconds"
 # 30 seconds is aggressive — tuned for fast feedback while developing.
 # Production would set this based on observed event lag (typically 1-5 min).
-WATERMARK_DELAY = "30 seconds"
+WATERMARK_DELAY = "5 minutes"
 
 CHECKPOINT_ROOT = os.getenv("SPARK_CHECKPOINT_DIR", "data/checkpoints")
 CHECKPOINT_HIGH_VALUE = f"{CHECKPOINT_ROOT}/fraud_high_value"

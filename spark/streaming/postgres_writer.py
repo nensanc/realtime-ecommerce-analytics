@@ -45,6 +45,10 @@ PG_CONFIG = {
 def pg_connection() -> Iterator[psycopg2.extensions.connection]:
     """Context-managed Postgres connection (commits on exit, rolls back on error)."""
     conn = psycopg2.connect(**PG_CONFIG)
+    # Pin the session timezone to UTC so naive datetimes are interpreted
+    # as UTC (not the client OS TZ) when written to TIMESTAMP columns.
+    with conn.cursor() as cur:
+        cur.execute("SET TIME ZONE 'UTC';")
     try:
         yield conn
         conn.commit()
